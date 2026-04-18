@@ -10,22 +10,17 @@
 
 **输出**
 
-每条序列的指标，汇总为一个 CSV 文件：
+每条序列的指标，按 mode 分开存为 CSV：
 
 | 列名 | 说明 |
 |---|---|
 | `animal` | 动物 ID（如 `bear3EP`） |
 | `seq` | rig 来源序列名（如 `bear3EP_Idle3`） |
-| `mode` | `reconstruction` 或 `transfer` |
 | `target` | 目标序列名（reconstruction 时与 `seq` 相同） |
-| `l1_mean` | 所有帧的平均逐顶点 L1 距离均值 |
-| `l1_std` | 逐帧 L1 的标准差 |
-| `l2_mean` | 所有帧的平均逐顶点 L2 距离均值 |
-| `l2_std` | 逐帧 L2 的标准差 |
-| `chamfer_l1_mean` | 所有帧的平均 Chamfer-L1 距离均值 |
-| `chamfer_l1_std` | 逐帧 Chamfer-L1 的标准差 |
-| `chamfer_l2_mean` | 所有帧的平均 Chamfer-L2 距离均值 |
-| `chamfer_l2_std` | 逐帧 Chamfer-L2 的标准差 |
+| `l1` | 所有帧的平均逐顶点 L1 距离 |
+| `l2` | 所有帧的平均逐顶点 L2 距离 |
+| `chamfer_l1` | 所有帧的平均 Chamfer-L1 距离 |
+| `chamfer_l2` | 所有帧的平均 Chamfer-L2 距离 |
 
 ---
 
@@ -37,8 +32,8 @@ dt4d_evaluator/
 │   ├── plan.md          ← 英文版方案
 │   └── plan_ch.md       ← 本文件
 ├── evaluator/
-│   ├── __init__.py      ← 公开 API：mpvd、chamfer
-│   └── metrics.py       ← mpvd()、chamfer()
+│   ├── __init__.py      ← 公开 API：l1、l2、chamfer_l1、chamfer_l2
+│   └── metrics.py       ← 指标实现（NumPy + PyTorch GPU）
 ├── run.py               ← 单条序列评估
 ├── batch.py             ← 批量评估，输出 CSV
 ├── input/               ← gitignored
@@ -51,14 +46,14 @@ dt4d_evaluator/
 
 ### `evaluator/metrics.py`
 
-纯 NumPy 数学运算，无 I/O。
+`l1`/`l2` 使用 NumPy（快，要求顶点对应）。`chamfer_l1`/`chamfer_l2` 使用 PyTorch GPU 加速，分块计算 pairwise 距离矩阵以避免显存 OOM。
 
 | 函数 | 签名 | 说明 |
 |---|---|---|
 | `l1` | `(fitted, target) → (T,)` | 逐帧平均逐顶点 L1 距离；要求顶点有对应关系 |
 | `l2` | `(fitted, target) → (T,)` | 逐帧平均逐顶点 L2 距离；要求顶点有对应关系 |
-| `chamfer_l1` | `(fitted, target) → (T,)` | 逐帧双向 Chamfer 距离（L1 最近邻） |
-| `chamfer_l2` | `(fitted, target) → (T,)` | 逐帧双向 Chamfer 距离（L2 最近邻） |
+| `chamfer_l1` | `(fitted, target, device) → (T,)` | 逐帧双向 Chamfer，mean of sqrt(min d²) |
+| `chamfer_l2` | `(fitted, target, device) → (T,)` | 逐帧双向 Chamfer，mean of min d² |
 
 ### `evaluator/__init__.py`
 
@@ -75,13 +70,11 @@ __all__ = ['l1', 'l2', 'chamfer_l1', 'chamfer_l2']
 python run.py --fitted fitted.npy --gt gt.npy
 ```
 
-将逐帧指标和汇总结果打印到 stdout。
-
 参数：`--fitted`、`--gt`。
 
 ### `batch.py`（批量评估）
 
-扫描 optimizer 的 output 目录，从 HDF5 加载真实序列，计算所有拟合序列的指标，写入一个 CSV。
+扫描 optimizer 的 output 目录，从 HDF5 加载真实序列，计算所有拟合序列的指标，按 mode 分开写入 CSV。
 
 ```
 python batch.py \
@@ -98,8 +91,9 @@ python batch.py \
 
 - **reconstruction**：真实序列 = rig 对应的同一序列（从 HDF5 的 `animal/seq` 读取）
 - **transfer**：真实序列 = 从同目录的 `meta.json` 读取 target key，再从 HDF5 加载
+- `reconstruction/` 或 `transfer/` 文件夹不存在时自动跳过
 
-参数：`--fitted_dir`、`--hdf5`、`--output_csv`。
+参数：`--fitted_dir`、`--hdf5`、`--output_dir`。
 
 ---
 
@@ -107,10 +101,10 @@ python batch.py \
 
 ### L1
 
-逐帧平均逐顶点 L1 距离。要求顶点有对应关系。
+逐帧平均逐顶点 L1（Manhattan）距离。要求顶点有对应关系。
 
 ```
-l1[t] = mean_v( sum_xyz |fitted[t,v,:] - target[t,v,:]| )
+l1[t] = mean_v( |Δx| + |Δy| + |Δz| )
 ```
 
 ### L2
@@ -118,31 +112,32 @@ l1[t] = mean_v( sum_xyz |fitted[t,v,:] - target[t,v,:]| )
 逐帧平均逐顶点 L2（欧氏）距离。要求顶点有对应关系。
 
 ```
-l2[t] = mean_v( ||fitted[t,v,:] - target[t,v,:]||_2 )
+l2[t] = mean_v( sqrt(Δx² + Δy² + Δz²) )
 ```
 
 ### Chamfer-L1
 
-用 L1 最近邻的双向 Chamfer 距离。不要求顶点对应关系。
+双向 Chamfer 距离，最近邻距离取欧氏距离（开根号）。不要求顶点对应关系。
 
 ```
-chamfer_l1[t] = mean_{v} min_{u} ||fitted[t,v] - target[t,u]||_1
-              + mean_{u} min_{v} ||target[t,u] - fitted[t,v]||_1
+chamfer_l1[t] = ( mean_{v} min_{u} ||fitted[t,v] - target[t,u]||_2
+               +  mean_{u} min_{v} ||target[t,u] - fitted[t,v]||_2 ) / 2
 ```
 
 ### Chamfer-L2
 
-用 L2 最近邻的双向 Chamfer 距离。不要求顶点对应关系。
+双向 Chamfer 距离，最近邻距离取平方欧氏距离。不要求顶点对应关系。
 
 ```
-chamfer_l2[t] = mean_{v} min_{u} ||fitted[t,v] - target[t,u]||²
-              + mean_{u} min_{v} ||target[t,u] - fitted[t,v]||²
+chamfer_l2[t] = ( mean_{v} min_{u} ||fitted[t,v] - target[t,u]||²
+               +  mean_{u} min_{v} ||target[t,u] - fitted[t,v]||² ) / 2
 ```
 
 ---
 
 ## 依赖项
 
+- `torch` — GPU 加速 Chamfer 计算
 - `numpy`
 - `h5py` — 从 `dt4d.hdf5` 加载真实序列
 - `pandas` — 写入 CSV 结果
